@@ -2,7 +2,7 @@
 
 # dependencies
 /node_modules
-/compress-pdf-backend/node_modules
+uploads/
 /.pnp
 .pnp.js
 
