@@ -3,9 +3,8 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const cors = require("cors");
-const { exec } = require("child_process");
-const muhammara = require("muhammara"); // Thay thế HummusJS bằng MuhammaraJS
 const { convert } = require("pdf-poppler"); // Dùng để chuyển PDF thành ảnh
+const pdfkit = require("pdfkit"); // Thay thế Muhammara bằng PDFKit
 
 const app = express();
 app.use(cors());
@@ -39,122 +38,123 @@ app.post("/compress", upload.single("file"), async (req, res) => {
 
   const inputPath = req.file.path;
   const tempPdfPath = path.resolve("uploads", "temp_converted.pdf");
-  const outputPath = path.resolve(
-    "uploads",
-    `compressed_${req.file.originalname.replace(/[^a-zA-Z0-9]/g, "_")}.pdf`
-  );
 
   try {
-    // Đọc PDF và chuyển mỗi trang thành hình ảnh
+    console.log("Starting PDF to image conversion...");
+    console.log("Input PDF Path:", inputPath);
+    // Đọc PDF và chuyển mỗi trang thành hình ảnh với chất lượng 30
     const options = {
       format: "jpeg",
       out_dir: "uploads",
       out_prefix: path.basename(inputPath, path.extname(inputPath)),
       page: null,
+      scale: 1000,
     };
+    console.log("Conversion options:", options);
 
-    let totalPages = 0;
-    const pdfInfo = await convert(inputPath, options).catch((error) => {
+    await convert(inputPath, options).catch((error) => {
       console.error("Error converting PDF to images:", error);
       throw error;
     });
-    totalPages = pdfInfo.length;
+
+    // Lấy danh sách các file ảnh được tạo ra và sắp xếp chúng
+    let imageFiles = fs
+      .readdirSync(options.out_dir)
+      .filter(
+        (file) =>
+          file.startsWith(options.out_prefix) &&
+          (file.endsWith(".jpg") || file.endsWith(".jpeg"))
+      );
+    imageFiles = imageFiles.sort((a, b) => {
+      const aPage = parseInt(a.split("-").pop().split(".")[0]);
+      const bPage = parseInt(b.split("-").pop().split(".")[0]);
+      return aPage - bPage;
+    });
+
+    if (imageFiles.length === 0) {
+      console.error(
+        "Conversion did not produce any images. Please check the input file."
+      );
+      return res.status(500).send("Error converting PDF to images");
+    }
+
+    const totalPages = imageFiles.length;
     progress.totalPages = totalPages;
+    console.log(`Total pages to convert: ${totalPages}`);
 
-    // Tạo một file PDF mới từ các hình ảnh đã nén bằng MuhammaraJS
-    const pdfWriter = muhammara.createWriter(tempPdfPath);
+    // Sử dụng Dynamic Import để nén các file JPEG bằng MozJPEG
+    const imagemin = (await import("imagemin")).default;
+    const imageminMozjpeg = (await import("imagemin-mozjpeg")).default;
 
-    for (let page = 1; page <= totalPages; page++) {
-      progress.completedPages = page;
-      const imgPath = path.resolve(
-        "uploads",
-        `${options.out_prefix}-${page}.jpg`
+    await imagemin(
+      imageFiles.map((file) => path.resolve("uploads", file)),
+      {
+        destination: "uploads/compressed",
+        plugins: [imageminMozjpeg({ quality: 300 })],
+      }
+    );
+
+    // Cập nhật danh sách file ảnh đã nén
+    imageFiles = fs
+      .readdirSync("uploads/compressed")
+      .filter(
+        (file) =>
+          file.startsWith(options.out_prefix) &&
+          (file.endsWith(".jpg") || file.endsWith(".jpeg"))
       );
 
+    // Tạo một file PDF mới từ các hình ảnh đã nén bằng PDFKit
+    console.log("Creating new PDF with images using PDFKit...");
+    const doc = new pdfkit();
+    const writeStream = fs.createWriteStream(tempPdfPath);
+    doc.pipe(writeStream);
+
+    writeStream.on("error", (err) => {
+      console.error("Error with writeStream:", err);
+    });
+
+    for (let i = 0; i < totalPages; i++) {
+      progress.completedPages = i + 1;
+      const imgPath = path.resolve("uploads/compressed", imageFiles[i]);
+
+      console.log(`Processing page ${i + 1}, image path: ${imgPath}`);
       // Thêm hình ảnh đã chuyển đổi vào tài liệu PDF
       if (fs.existsSync(imgPath)) {
-        const pageDimensions = { width: 595.28, height: 841.89 }; // Kích thước chuẩn A4
-        const pageContext = pdfWriter.createPage(
-          0,
-          0,
-          pageDimensions.width,
-          pageDimensions.height
-        );
-        const context = pdfWriter.startPageContentContext(pageContext);
-        context.drawImage(0, 0, imgPath, {
-          transformation: {
-            width: pageDimensions.width,
-            height: pageDimensions.height,
-          },
-        });
-        pdfWriter.writePage(pageContext);
+        console.log(`Image file found: ${imgPath}`);
+        const dimensions = doc.openImage(imgPath);
+        doc.addPage({ size: [dimensions.width, dimensions.height] });
+        doc.image(imgPath, 0, 0);
+        console.log(`Added image ${imgPath} to PDF.`);
       } else {
         console.error(`Image file not found: ${imgPath}`);
       }
     }
 
-    pdfWriter.end();
+    doc.end();
 
-    console.log("Image-based PDF created, running Ghostscript...");
+    writeStream.on("finish", () => {
+      console.log("Image-based PDF created at:", tempPdfPath);
+      res.download(tempPdfPath, (err) => {
+        if (err) {
+          console.error("Error during download:", err);
+          return res.status(500).send("Error downloading PDF");
+        }
 
-    // Nén PDF bằng Ghostscript
-    const command = `"C:/Program Files/gs/gs10.04.0/bin/gswin64c.exe" -sDEVICE=pdfwrite \
-      -dCompatibilityLevel=1.4 \
-      -dPDFSETTINGS=/screen \
-      -dNOPAUSE -dBATCH \
-      -dDownsampleColorImages=true -dColorImageResolution=72 \
-      -dDownsampleGrayImages=true -dGrayImageResolution=72 \
-      -dDownsampleMonoImages=true -dMonoImageResolution=72 \
-      -dJPEGQ=75 \
-      -sOutputFile="${outputPath}" "${tempPdfPath}"`;
-
-    console.log("Running command:", command);
-
-    const gsProcess = exec(command);
-
-    gsProcess.stdout.on("data", (data) => {
-      console.log(data);
-    });
-
-    gsProcess.on("exit", (code) => {
-      if (code === 0) {
-        console.log("Compression finished, checking output...");
-        fs.access(outputPath, fs.constants.F_OK, (err) => {
-          if (err) {
-            console.error("Compressed file not found:", outputPath);
-            return res.status(404).send("Compressed file not found");
-          }
-
-          // Gửi file nén cho client
-          res.download(outputPath, (err) => {
-            if (err) {
-              console.error("Error during download:", err);
-              return res.status(500).send("Error downloading compressed PDF");
-            }
-
-            // Cleanup: Xóa file tạm sau khi hoàn tất
-            fs.unlink(inputPath, (err) => {
-              if (err) console.error("Error deleting input file:", err);
-            });
-            fs.unlink(tempPdfPath, (err) => {
-              if (err) console.error("Error deleting temp PDF file:", err);
-            });
-            // fs.unlink(outputPath, (err) => {
-            //   if (err) console.error("Error deleting output file:", err);
-            // });
-
-            progress = { completedPages: 0, totalPages: 0 }; // Đặt lại tiến trình sau khi hoàn tất
-          });
+        console.log("PDF downloaded successfully.");
+        // Cleanup: Xóa file tạm sau khi hoàn tất
+        fs.unlink(inputPath, (err) => {
+          if (err) console.error("Error deleting input file:", err);
         });
-      } else {
-        console.error("Ghostscript exited with code:", code);
-        progress = { completedPages: 0, totalPages: 0 };
-        res.status(500).send("Error compressing PDF");
-      }
+        // fs.unlink(tempPdfPath, (err) => {
+        //   if (err) console.error("Error deleting temp PDF file:", err);
+        // });
+
+        progress = { completedPages: 0, totalPages: 0 }; // Đặt lại tiến trình sau khi hoàn tất
+      });
     });
   } catch (error) {
     console.error("Error during PDF compression:", error);
-    res.status(500).send("Error compressing PDF");
+    return res.status(500).send("Error compressing PDF");
   }
 });
 
